@@ -51,18 +51,20 @@ type Detector struct {
 }
 
 type Config struct {
-	ModelPath   string
-	OrtLibPath  string
-	QnnLibPath  string
-	ConfThresh  float64
+	ModelPath  string
+	OrtLibPath string
+	QnnLibPath string
+	QnnHtpPath string
+	ConfThresh float64
 }
 
 func DefaultConfig() Config {
 	return Config{
-		ModelPath:   "/root/.local/lib/yolo26n_qnn_v81.onnx",
-		OrtLibPath:  "/root/.local/lib/onnxruntime/lib/libonnxruntime.so",
-		QnnLibPath:  "/root/.local/lib/onnxruntime-qnn/libonnxruntime_providers_qnn.so",
-		ConfThresh:  0.45,
+		ModelPath:  "/data/data/com.termux/files/home/.local/lib/yolo26n_qnn_v81.onnx",
+		OrtLibPath: "/data/data/com.termux/files/home/.local/lib/libonnxruntime.so",
+		QnnLibPath: "/data/data/com.termux/files/home/.local/lib/libonnxruntime_providers_qnn.so",
+		QnnHtpPath: "/vendor/lib64/libQnnHtp.so",
+		ConfThresh: 0.45,
 	}
 }
 
@@ -95,10 +97,6 @@ func New(cfg Config) (*Detector, error) {
 		}
 	}
 
-	if qnnDevice == 0 {
-		fmt.Println("WARNING: QNNExecutionProvider not found, running on CPU")
-	}
-
 	opts, err := engine.NewSessionOptions()
 	if err != nil {
 		return nil, fmt.Errorf("create session options: %w", err)
@@ -109,20 +107,29 @@ func New(cfg Config) (*Detector, error) {
 		}
 	}()
 
-	if qnnDevice != 0 {
-		if err := opts.AppendExecutionProviderV2([]uintptr{qnnDevice}, map[string]string{
-			"backend_type":                 "htp",
-			"htp_arch":                     "81",
-			"enable_htp_fp16_precision":    "1",
-			"enable_htp_shared_memory_allocator": "1",
-		}); err != nil {
-			return nil, fmt.Errorf("append QNN EP: %w", err)
-		}
-		fmt.Println("QNN EP appended (HTP v81)")
+	qnnOpts := map[string]string{
+		"backend_path":                 cfg.QnnHtpPath,
+		"htp_arch":                     "81",
+		"enable_htp_fp16_precision":    "1",
+		"enable_htp_shared_memory_allocator": "1",
 	}
 
-	if err := opts.AddSessionConfigEntry("session.disable_cpu_ep_fallback", "1"); err != nil {
-		fmt.Printf("WARNING: disable_cpu_ep_fallback failed: %v\n", err)
+	var qnnOK bool
+	if qnnDevice != 0 {
+		qnnOK = opts.AppendExecutionProviderV2([]uintptr{qnnDevice}, qnnOpts) == nil
+	}
+	if !qnnOK {
+		fmt.Println("V2 device not found, trying V1 by-name fallback...")
+		qnnOpts["backend_type"] = "htp"
+		qnnOK = opts.AppendExecutionProvider("QNNExecutionProvider", qnnOpts) == nil
+	}
+	if qnnOK {
+		fmt.Println("QNN EP appended (HTP v81)")
+		if err := opts.AddSessionConfigEntry("session.disable_cpu_ep_fallback", "1"); err != nil {
+			fmt.Printf("WARNING: disable_cpu_ep_fallback failed: %v\n", err)
+		}
+	} else {
+		fmt.Println("QNN EP NOT available, running on CPU")
 	}
 
 	session, err := engine.NewSession(cfg.ModelPath, opts)

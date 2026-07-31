@@ -27,9 +27,10 @@ type FrameResult struct {
 func main() {
 	var (
 		host       = flag.String("host", "localhost:8080", "streamer WebSocket address")
-		modelPath  = flag.String("model", "/root/.local/lib/yolo26n_qnn_v81.onnx", "model path")
-		ortLib     = flag.String("ort-lib", "/root/.local/lib/onnxruntime/lib/libonnxruntime.so", "ONNX Runtime library path")
-		qnnLib     = flag.String("qnn-lib", "/root/.local/lib/onnxruntime-qnn/libonnxruntime_providers_qnn.so", "QNN EP plugin path")
+		modelPath  = flag.String("model", "/data/data/com.termux/files/home/.local/lib/yolo26n_qnn_v81.onnx", "model path")
+		ortLib     = flag.String("ort-lib", "/data/data/com.termux/files/home/.local/lib/libonnxruntime.so", "ONNX Runtime library path")
+		qnnLib     = flag.String("qnn-lib", "/data/data/com.termux/files/home/.local/lib/libonnxruntime_providers_qnn.so", "QNN EP plugin path")
+		qnnHtp     = flag.String("qnn-htp", "/vendor/lib64/libQnnHtp.so", "QNN HTP backend path")
 		confThresh = flag.Float64("conf", 0.45, "confidence threshold")
 		maxRetries = flag.Int("retry", 0, "max connect retries (0=infinite)")
 	)
@@ -47,6 +48,9 @@ func main() {
 	}
 	if *qnnLib != "" {
 		cfg.QnnLibPath = *qnnLib
+	}
+	if *qnnHtp != "" {
+		cfg.QnnHtpPath = *qnnHtp
 	}
 	if *confThresh > 0 {
 		cfg.ConfThresh = *confThresh

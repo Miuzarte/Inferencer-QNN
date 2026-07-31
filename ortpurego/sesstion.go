@@ -149,6 +149,20 @@ func (o *SessionOptions) AppendExecutionProviderV2(devices []uintptr, opts map[s
 	return o.engine.checkStatus(status)
 }
 
+// AppendExecutionProvider 使用 V1 by-name API 挂载 EP（QNN EP fallback）
+func (o *SessionOptions) AppendExecutionProvider(name string, opts map[string]string) error {
+	providerNamePtr, err := stringToCString(name)
+	if err != nil {
+		return fmt.Errorf("failed to prepare provider name: %w", err)
+	}
+	pKeys, pVals, nKeys, err := buildKVArrays(opts)
+	if err != nil {
+		return err
+	}
+	status := o.engine.funcs.sessionOptionsAppendExecutionProvider(o.handle, providerNamePtr, pKeys, pVals, nKeys)
+	return o.engine.checkStatus(status)
+}
+
 // EnableTensorRT 启用 TensorRT
 // 注：V1 by-name API 对 NVIDIA 定制 ORT 无效，请使用 RegisterExecutionProviderLibrary + AppendExecutionProviderV2
 func (o *SessionOptions) EnableTensorRT(opts map[string]string) error {
