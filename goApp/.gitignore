@@ -1,0 +1,6 @@
+tmp/
+
+# 无授权 / All Rights Reserved
+# Qualcomm QNN SDK 专有头文件
+qnn-headers/**/*.h
+qnn-headers/**/*.hpp

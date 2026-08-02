@@ -1,0 +1,47 @@
+// Package tjpeg 用 libjpeg-turbo 把 JPEG 直接解码为 RGB。
+// 仅用于 Termux 等安装了 libjpeg-turbo 的环境（cgo 构建）。
+package tjpeg
+
+/*
+#cgo LDFLAGS: -lturbojpeg
+#include <turbojpeg.h>
+#include <stdlib.h>
+*/
+import "C"
+
+import (
+	"fmt"
+	"unsafe"
+)
+
+// DecodeJPEG 把 JPEG 解码为 RGB（每像素 3 字节），返回尺寸。
+func DecodeJPEG(data []byte) (rgb []byte, w, h int, err error) {
+	if len(data) == 0 {
+		return nil, 0, 0, fmt.Errorf("empty jpeg data")
+	}
+	handle := C.tjInitDecompress()
+	if handle == nil {
+		return nil, 0, 0, fmt.Errorf("tjInitDecompress failed")
+	}
+	defer C.tjDestroy(handle)
+
+	var cw, ch, subsamp, colorspace C.int
+	rc := C.tjDecompressHeader3(handle,
+		(*C.uchar)(unsafe.Pointer(&data[0])), C.ulong(len(data)),
+		&cw, &ch, &subsamp, &colorspace)
+	if rc != 0 {
+		return nil, 0, 0, fmt.Errorf("tjDecompressHeader3: %s", C.GoString(C.tjGetErrorStr2(handle)))
+	}
+	w, h = int(cw), int(ch)
+	if w <= 0 || h <= 0 {
+		return nil, 0, 0, fmt.Errorf("bad jpeg size %dx%d", w, h)
+	}
+	rgb = make([]byte, w*h*3)
+	rc = C.tjDecompress2(handle,
+		(*C.uchar)(unsafe.Pointer(&data[0])), C.ulong(len(data)),
+		(*C.uchar)(unsafe.Pointer(&rgb[0])), cw, 0, ch, C.TJPF_RGB, 0)
+	if rc != 0 {
+		return nil, 0, 0, fmt.Errorf("tjDecompress2: %s", C.GoString(C.tjGetErrorStr2(handle)))
+	}
+	return rgb, w, h, nil
+}
