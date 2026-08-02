@@ -34,20 +34,20 @@ var cocoNames = []string{
 }
 
 type Detection struct {
-	X1         float64 `json:"x1"`
-	Y1         float64 `json:"y1"`
-	X2         float64 `json:"x2"`
-	Y2         float64 `json:"y2"`
-	Score      float64 `json:"score"`
-	Class      int     `json:"class"`
-	ClassName  string  `json:"class_name"`
+	X1        float64 `json:"x1"`
+	Y1        float64 `json:"y1"`
+	X2        float64 `json:"x2"`
+	Y2        float64 `json:"y2"`
+	Score     float64 `json:"score"`
+	Class     int     `json:"class"`
+	ClassName string  `json:"class_name"`
 }
 
 type Detector struct {
-	session     *ort.Session
-	confThresh  float64
-	inputData   []float32
-	mu          sync.Mutex
+	session    *ort.Session
+	confThresh float64
+	inputData  []float32
+	mu         sync.Mutex
 }
 
 type Config struct {
@@ -76,9 +76,12 @@ func New(cfg Config) (*Detector, error) {
 	fmt.Printf("ORT version: %s\n", engine.GetVersion())
 
 	if err := engine.RegisterExecutionProviderLibrary("QNNExecutionProvider", cfg.QnnLibPath); err != nil {
-		return nil, fmt.Errorf("register QNN EP: %w", err)
+		// 插件构建需要注册；monolithic ORT 构建（如 onnxruntime-android-qnn）不需要，
+		// 此时由后面的 V1 by-name 或 V2 设备路径决定是否可用。
+		fmt.Printf("WARNING: register QNN EP plugin failed (monolithic ORT?): %v\n", err)
+	} else {
+		fmt.Println("QNN EP registered")
 	}
-	fmt.Println("QNN EP registered")
 
 	devices, err := engine.GetEpDevices()
 	if err != nil {
@@ -108,20 +111,30 @@ func New(cfg Config) (*Detector, error) {
 	}()
 
 	qnnOpts := map[string]string{
-		"backend_path":                 cfg.QnnHtpPath,
-		"htp_arch":                     "81",
-		"enable_htp_fp16_precision":    "1",
+		"backend_path":                       cfg.QnnHtpPath,
+		"htp_arch":                           "81",
+		"enable_htp_fp16_precision":          "1",
 		"enable_htp_shared_memory_allocator": "1",
 	}
 
 	var qnnOK bool
+	var v2Err, v1Err error
 	if qnnDevice != 0 {
-		qnnOK = opts.AppendExecutionProviderV2([]uintptr{qnnDevice}, qnnOpts) == nil
+		v2Err = opts.AppendExecutionProviderV2([]uintptr{qnnDevice}, qnnOpts)
+		qnnOK = v2Err == nil
 	}
 	if !qnnOK {
 		fmt.Println("V2 device not found, trying V1 by-name fallback...")
-		qnnOpts["backend_type"] = "htp"
-		qnnOK = opts.AppendExecutionProvider("QNNExecutionProvider", qnnOpts) == nil
+		if v2Err != nil {
+			fmt.Printf("  V2 error: %v\n", v2Err)
+		}
+		// 注意：backend_type 与 backend_path 不能同时设置（ORT 会抛
+		// "Only one of 'backend_type' and 'backend_path' should be set"）。
+		v1Err = opts.AppendExecutionProvider("QNNExecutionProvider", qnnOpts)
+		qnnOK = v1Err == nil
+		if v1Err != nil {
+			fmt.Printf("  V1 error: %v\n", v1Err)
+		}
 	}
 	if qnnOK {
 		fmt.Println("QNN EP appended (HTP v81)")

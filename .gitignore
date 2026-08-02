@@ -1,3 +1,4 @@
 inferencer
-*.exe
+inferencer.exe
+
 build/
