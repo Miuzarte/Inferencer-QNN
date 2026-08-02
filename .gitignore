@@ -2,3 +2,7 @@ inferencer
 inferencer.exe
 
 build/
+
+# IDE 配置与调试截图（不入库）
+androidApp/.idea/
+androidApp/screenshot/
