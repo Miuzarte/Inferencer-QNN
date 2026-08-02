@@ -2,7 +2,7 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.INTERNET" />
     <application
-        android:label="inferencer_flutter"
+        android:label="Inferencer"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <activity
