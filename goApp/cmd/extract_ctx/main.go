@@ -10,9 +10,10 @@ import (
 	"fmt"
 	"os"
 
-	"Inferencer/logging"
-	"github.com/rs/zerolog/log"
+	"Inferencer/logger"
 )
+
+var log = logger.New("ExtractCtx")
 
 // mini protobuf wire parser（只覆盖 ONNX ModelProto 需要的字段）
 type field struct {
@@ -103,7 +104,6 @@ func main() {
 	modelPath := flag.String("model", "models/yolo26n_v73_qnn.onnx", "path to official qnn onnx model")
 	outPath := flag.String("out", "models/ctx_v73.bin", "output context binary path")
 	flag.Parse()
-	logging.Init("info")
 
 	model, err := os.ReadFile(*modelPath)
 	if err != nil {

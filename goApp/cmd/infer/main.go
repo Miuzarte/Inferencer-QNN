@@ -18,11 +18,13 @@ import (
 	"os"
 	"time"
 
-	"Inferencer/logging"
+	"Inferencer/logger"
 	"Inferencer/qnn"
 	"Inferencer/yolo"
-	"github.com/rs/zerolog/log"
+	"github.com/rs/zerolog"
 )
+
+var log = logger.New("Infer")
 
 type detOut struct {
 	X1, Y1, X2, Y2, Score float32 `json:",string"`
@@ -39,12 +41,9 @@ func main() {
 	outPath := flag.String("out", "", "optional output JPEG with boxes")
 	verbose := flag.Bool("v", false, "verbose")
 	flag.Parse()
-
-	logLevel := "info"
 	if *verbose {
-		logLevel = "debug"
+		logger.SetGlobalLevel(zerolog.TraceLevel)
 	}
-	logging.Init(logLevel)
 
 	if *imagePath == "" {
 		log.Error().Msg("usage: infer -image test.jpg [-ctx models/ctx_v73.bin] [-lib ...]")

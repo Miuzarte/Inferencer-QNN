@@ -24,12 +24,14 @@ import (
 	"unsafe"
 
 	tjpeg "Inferencer/jpeg"
-	"Inferencer/logging"
+	"Inferencer/logger"
 	"Inferencer/qnn"
 	"Inferencer/yolo"
 	"github.com/coder/websocket"
-	"github.com/rs/zerolog/log"
+	"github.com/rs/zerolog"
 )
+
+var log = logger.New("Streamer")
 
 type remoteDetection struct {
 	X1        float64 `json:"x1"`
@@ -152,12 +154,9 @@ func main() {
 	bench := flag.Bool("bench", false, "per-stage timing stats")
 	affinity := flag.Int("affinity", -1, "pin inference thread to CPU N (e.g. 7 = prime core; -1 = disabled)")
 	flag.Parse()
-
-	logLevel := "info"
 	if *verbose {
-		logLevel = "debug"
+		logger.SetGlobalLevel(zerolog.TraceLevel)
 	}
-	logging.Init(logLevel)
 
 	ctxBin, err := os.ReadFile(*ctxPath)
 	if err != nil {
