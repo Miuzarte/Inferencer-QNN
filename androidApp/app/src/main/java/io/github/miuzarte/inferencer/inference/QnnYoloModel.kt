@@ -191,11 +191,13 @@ class QnnYoloModel(
         padX: Float,
         padY: Float,
     ): List<DetBox> {
+        // QNN 输出的框坐标是 640 尺度像素（letterbox 图坐标），与 goApp 直连 QNN 一致；
+        // 不能乘 MODEL_SIZE，否则归一化结果全部溢出并被 coerceIn 钳到 0/1。
         val xNorm: (Float) -> Float = { v ->
-            ((v * MODEL_SIZE - padX) / scale / srcW).coerceIn(0f, 1f)
+            ((v - padX) / scale / srcW).coerceIn(0f, 1f)
         }
         val yNorm: (Float) -> Float = { v ->
-            ((v * MODEL_SIZE - padY) / scale / srcH).coerceIn(0f, 1f)
+            ((v - padY) / scale / srcH).coerceIn(0f, 1f)
         }
         val result = mutableListOf<DetBox>()
 

@@ -2,7 +2,6 @@ package io.github.miuzarte.inferencer.ui.components
 
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
@@ -10,10 +9,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import top.yukonga.miuix.kmp.basic.Button
+import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.LinearProgressIndicator
-import top.yukonga.miuix.kmp.basic.Slider
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextField
+import top.yukonga.miuix.kmp.preference.SliderPreference
 
 @Composable
 fun RemotePanel(
@@ -45,6 +45,7 @@ fun RemotePanel(
         Button(
             onClick = { if (connected) onDisconnect() else onConnect() },
             enabled = !downloading,
+            colors = ButtonDefaults.buttonColorsPrimary(),
             modifier = Modifier.fillMaxWidth(),
         ) {
             Text(text = if (connected) "Disconnect" else "Connect")
@@ -58,14 +59,13 @@ fun RemotePanel(
         status?.let {
             Text(text = it, fontSize = 12.sp)
         }
-        Row(verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
-            Text(text = "Conf", fontSize = 12.sp)
-            Slider(
-                value = conf,
-                onValueChange = onConfChange,
-                valueRange = 0.05f..0.95f,
-                modifier = Modifier.weight(1f),
-            )
-        }
+        SliderPreference(
+            title = "Conf",
+            value = conf,
+            onValueChange = onConfChange,
+            valueRange = 0.05f..0.95f,
+            valueText = "%.2f".format(conf),
+            modifier = Modifier.fillMaxWidth(),
+        )
     }
 }

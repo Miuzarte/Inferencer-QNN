@@ -9,6 +9,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+
+	"Inferencer/logging"
+	"github.com/rs/zerolog/log"
 )
 
 // mini protobuf wire parser（只覆盖 ONNX ModelProto 需要的字段）
@@ -100,10 +103,11 @@ func main() {
 	modelPath := flag.String("model", "models/yolo26n_v73_qnn.onnx", "path to official qnn onnx model")
 	outPath := flag.String("out", "models/ctx_v73.bin", "output context binary path")
 	flag.Parse()
+	logging.Init("info")
 
 	model, err := os.ReadFile(*modelPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "read model:", err)
+		log.Error().Err(err).Msg("read model")
 		os.Exit(1)
 	}
 
@@ -127,20 +131,20 @@ func main() {
 		}
 	}
 	if ctx == nil {
-		fmt.Fprintln(os.Stderr, "ep_cache_context attribute not found")
+		log.Error().Msg("ep_cache_context attribute not found")
 		os.Exit(1)
 	}
 	if err := os.WriteFile(*outPath, ctx, 0o644); err != nil {
-		fmt.Fprintln(os.Stderr, "write:", err)
+		log.Error().Err(err).Msg("write failed")
 		os.Exit(1)
 	}
-	fmt.Printf("extracted %d bytes -> %s (md5 %x)\n", len(ctx), *outPath, md5.Sum(ctx))
+	log.Info().Int("bytes", len(ctx)).Str("out", *outPath).Msgf("extracted (md5 %x)", md5.Sum(ctx))
 }
 
 func parseFieldsOrDie(b []byte) []field {
 	fs, err := parseFields(b)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "protobuf parse:", err)
+		log.Error().Err(err).Msg("protobuf parse failed")
 		os.Exit(1)
 	}
 	return fs

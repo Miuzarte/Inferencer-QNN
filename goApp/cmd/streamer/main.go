@@ -24,9 +24,11 @@ import (
 	"unsafe"
 
 	tjpeg "Inferencer/jpeg"
+	"Inferencer/logging"
 	"Inferencer/qnn"
 	"Inferencer/yolo"
 	"github.com/coder/websocket"
+	"github.com/rs/zerolog/log"
 )
 
 type remoteDetection struct {
@@ -109,7 +111,7 @@ func pinThread(cpu int, timeout time.Duration) error {
 			pinnedCPU.Store(int64(cpu))
 			tid, _, _ := syscall.Syscall(syscall.SYS_GETTID, 0, 0, 0)
 			pinnedTID.Store(int64(tid))
-			fmt.Printf("pinned inference thread to cpu%d\n", cpu)
+			log.Info().Int("cpu", cpu).Msg("pinned inference thread")
 			return nil
 		} else {
 			lastErr = err
@@ -151,41 +153,62 @@ func main() {
 	affinity := flag.Int("affinity", -1, "pin inference thread to CPU N (e.g. 7 = prime core; -1 = disabled)")
 	flag.Parse()
 
+	logLevel := "info"
+	if *verbose {
+		logLevel = "debug"
+	}
+	logging.Init(logLevel)
+
 	ctxBin, err := os.ReadFile(*ctxPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "read ctx:", err)
+		log.Error().Err(err).Msg("read ctx")
 		os.Exit(1)
 	}
 
-	fmt.Printf("creating QNN session (lib=%s arch=%d)...\n", *libDir, *arch)
+	log.Info().Str("lib", *libDir).Int("arch", *arch).Msg("creating QNN session")
 	sess, err := qnn.Create(*libDir, *arch, *verbose)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		log.Error().Err(err).Msg("qnn create failed")
 		os.Exit(1)
 	}
 	defer sess.Close()
 	if err := sess.LoadBinary(ctxBin); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		log.Error().Err(err).Msg("load binary failed")
 		os.Exit(1)
 	}
 	_, inDims, _, outDims, inDtype, inScale, inOffset, outDtype, outScale, outOffset, err :=
 		sess.IOInfo()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		log.Error().Err(err).Msg("io info failed")
 		os.Exit(1)
 	}
-	fmt.Printf("graph IO: %v (dtype=%d scale=%f off=%d) -> %v (dtype=%d scale=%f off=%d)\n",
-		inDims, inDtype, inScale, inOffset, outDims, outDtype, outScale, outOffset)
+	log.Info().
+		Interface("in_dims", inDims).Int("in_dtype", inDtype).
+		Float32("in_scale", inScale).Int32("in_offset", inOffset).
+		Interface("out_dims", outDims).Int("out_dtype", outDtype).
+		Float32("out_scale", outScale).Int32("out_offset", outOffset).
+		Msg("graph IO")
 
 	inBytes := make([]byte, 640*640*3*2)
 	outBytes := make([]byte, 84*8400*2)
 
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// Termux 下 QNN 库在进程退出阶段（内部线程清理）会触发 SIGABRT，
+	// 即使 qnn_destroy 已跳过 QnnContext_free 也一样。因此收到
+	// ctrl+c/SIGTERM 时直接 os.Exit，跳过 Go 正常退出路径与 QNN 清理。
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Info().Str("signal", sig.String()).Msg("received signal, exiting without QNN cleanup")
+		os.Exit(0)
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	if *affinity >= 0 {
 		if err := pinThread(*affinity, 20*time.Second); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: %v (continue without pinning)\n", err)
+			log.Warn().Err(err).Msg("pin failed, continue without pinning")
 		}
 	}
 
@@ -207,11 +230,15 @@ func main() {
 				if f > 0 {
 					avg = float64(ms) / float64(f) / 1000
 				}
-				fmt.Printf("[stats] fps=%.1f frames=%d avg_infer_ms=%.2f last_infer_ms=%.2f\n",
-					float64(f)/5, f, avg, float64(lastMS.Load())/1000)
+				log.Info().
+					Float64("fps", float64(f)/5).
+					Uint64("frames", f).
+					Float64("avg_infer_ms", avg).
+					Float64("last_infer_ms", float64(lastMS.Load())/1000).
+					Msg("stats")
 				if *bench {
 					bf := benchFrames.Swap(0)
-					fmt.Printf("[bench] frames=%d", bf)
+					ev := log.Info().Uint64("frames", bf)
 					for i := 0; i < numStages; i++ {
 						s := benchSum[i].Swap(0)
 						m := benchMax[i].Swap(0)
@@ -219,9 +246,11 @@ func main() {
 						if bf > 0 {
 							avg = float64(s) / float64(bf) / 1000
 						}
-						fmt.Printf(" %s=%.2f/%.2f", stageNames[i], avg, float64(m)/1000)
+						ev = ev.
+							Float64(stageNames[i]+"_avg", avg).
+							Float64(stageNames[i]+"_max", float64(m)/1000)
 					}
-					fmt.Println()
+					ev.Msg("bench")
 				}
 				if *affinity >= 0 {
 					tid := pinnedTID.Load()
@@ -235,9 +264,13 @@ func main() {
 							}
 							freqB, _ := os.ReadFile(fmt.Sprintf(
 								"/sys/devices/system/cpu/cpu%d/cpufreq/scaling_cur_freq", *affinity))
-							fmt.Printf("[aff] cpu%d pinned=%d proc=%d busy=%.1f%% freq=%s\n",
-								*affinity, pinnedCPU.Load(), procNo, pct,
-								strings.TrimSpace(string(freqB)))
+							log.Info().
+								Int("cpu", *affinity).
+								Int64("pinned", pinnedCPU.Load()).
+								Int64("proc", procNo).
+								Float64("busy_pct", pct).
+								Str("freq", strings.TrimSpace(string(freqB))).
+								Msg("affinity")
 						}
 						lastAffTicks = ticks
 					}
@@ -250,12 +283,12 @@ func main() {
 
 	// 断线重连循环
 	for {
-		fmt.Printf("connecting %s ...\n", *wsURL)
+		log.Info().Str("url", *wsURL).Msg("connecting")
 		c, _, err := websocket.Dial(ctx, *wsURL, &websocket.DialOptions{
 			CompressionMode: websocket.CompressionContextTakeover,
 		})
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "dial: %v (retry in 3s)\n", err)
+			log.Warn().Err(err).Msg("dial failed, retry in 3s")
 			select {
 			case <-ctx.Done():
 				return
@@ -263,13 +296,13 @@ func main() {
 			}
 			continue
 		}
-		fmt.Println("connected")
+		log.Info().Msg("connected")
 		c.SetReadLimit(16 << 20) // 640x640 JPEG 帧可达百 KB 级，默认 32KB 会直接断连
 
 		if *affinity >= 0 {
 			// 断线重连期间调度器可能收窄了大核，连接成功后重新确认绑定
 			if err := pinThread(*affinity, 8*time.Second); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: %v (continue without pinning)\n", err)
+				log.Warn().Err(err).Msg("pin failed, continue without pinning")
 			}
 		}
 
@@ -278,7 +311,7 @@ func main() {
 			mt, data, err := c.Read(ctx)
 			addBench(stRead, time.Since(t0))
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "read: %v (reconnect)\n", err)
+				log.Error().Err(err).Msg("read failed, reconnect")
 				c.Close(websocket.StatusNormalClosure, "reconnect")
 				break
 			}
@@ -305,7 +338,7 @@ func main() {
 				ms, err = sess.Execute(inBytes, outBytes)
 				addBench(stExecute, time.Since(t5))
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "execute: %v\n", err)
+					log.Error().Err(err).Msg("execute failed")
 					continue
 				}
 				t7 := time.Now()
@@ -318,11 +351,11 @@ func main() {
 			} else {
 				// 回退路径：任意尺寸 JPEG，走 stdlib 解码 + letterbox + float 量化。
 				if jerr != nil {
-					fmt.Fprintf(os.Stderr, "jpeg decode: %v (fallback)\n", jerr)
+					log.Warn().Err(jerr).Msg("jpeg decode failed, fallback")
 				}
 				img, srcW, srcH, derr := yolo.Decode(jpegData)
 				if derr != nil {
-					fmt.Fprintf(os.Stderr, "decode: %v\n", derr)
+					log.Error().Err(derr).Msg("decode failed")
 					continue
 				}
 				t2 := time.Now()
@@ -338,7 +371,7 @@ func main() {
 				ms, err = sess.Execute(inBytes, outBytes)
 				addBench(stExecute, time.Since(t5))
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "execute: %v\n", err)
+					log.Error().Err(err).Msg("execute failed")
 					continue
 				}
 				t6 := time.Now()
@@ -370,7 +403,7 @@ func main() {
 			err = c.Write(ctx, websocket.MessageText, payload)
 			addBench(stWrite, time.Since(t9))
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "write: %v\n", err)
+				log.Error().Err(err).Msg("write failed")
 				c.Close(websocket.StatusAbnormalClosure, "write error")
 				break
 			}

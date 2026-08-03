@@ -9,7 +9,6 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
@@ -19,8 +18,10 @@ import (
 	"os"
 	"time"
 
+	"Inferencer/logging"
 	"Inferencer/qnn"
 	"Inferencer/yolo"
+	"github.com/rs/zerolog/log"
 )
 
 type detOut struct {
@@ -39,47 +40,56 @@ func main() {
 	verbose := flag.Bool("v", false, "verbose")
 	flag.Parse()
 
+	logLevel := "info"
+	if *verbose {
+		logLevel = "debug"
+	}
+	logging.Init(logLevel)
+
 	if *imagePath == "" {
-		fmt.Fprintln(os.Stderr, "usage: infer -image test.jpg [-ctx models/ctx_v73.bin] [-lib ...]")
+		log.Error().Msg("usage: infer -image test.jpg [-ctx models/ctx_v73.bin] [-lib ...]")
 		os.Exit(1)
 	}
 
 	jpegData, err := os.ReadFile(*imagePath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "read image:", err)
+		log.Error().Err(err).Msg("read image")
 		os.Exit(1)
 	}
 	ctxBin, err := os.ReadFile(*ctxPath)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "read ctx:", err)
+		log.Error().Err(err).Msg("read ctx")
 		os.Exit(1)
 	}
 
-	fmt.Printf("creating QNN session (lib=%s arch=%d)...\n", *libDir, *arch)
+	log.Info().Str("lib", *libDir).Int("arch", *arch).Msg("creating QNN session")
 	sess, err := qnn.Create(*libDir, *arch, *verbose)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		log.Error().Err(err).Msg("qnn create failed")
 		os.Exit(1)
 	}
 	defer sess.Close()
 
 	if err := sess.LoadBinary(ctxBin); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		log.Error().Err(err).Msg("load binary failed")
 		os.Exit(1)
 	}
 	inName, inDims, outName, outDims, inDtype, inScale, inOffset,
 		outDtype, outScale, outOffset, err := sess.IOInfo()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		log.Error().Err(err).Msg("io info failed")
 		os.Exit(1)
 	}
-	fmt.Printf("graph IO: %s %v (dtype=%d scale=%f off=%d) -> %s %v (dtype=%d scale=%f off=%d)\n",
-		inName, inDims, inDtype, inScale, inOffset,
-		outName, outDims, outDtype, outScale, outOffset)
+	log.Info().
+		Str("in_name", inName).Interface("in_dims", inDims).
+		Int("in_dtype", inDtype).Float32("in_scale", inScale).Int32("in_offset", inOffset).
+		Str("out_name", outName).Interface("out_dims", outDims).
+		Int("out_dtype", outDtype).Float32("out_scale", outScale).Int32("out_offset", outOffset).
+		Msg("graph IO")
 
 	input, scale, padX, padY, srcW, srcH, err := yolo.Preprocess(jpegData)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		log.Error().Err(err).Msg("preprocess failed")
 		os.Exit(1)
 	}
 	inBytes := quantizeInput(input, inScale, inOffset)
@@ -87,7 +97,7 @@ func main() {
 
 	// 预热一次（首次加载 Skel/上下文）
 	if _, err := sess.Execute(inBytes, outBytes); err != nil {
-		fmt.Fprintln(os.Stderr, "warmup:", err)
+		log.Error().Err(err).Msg("warmup failed")
 		os.Exit(1)
 	}
 
@@ -98,7 +108,7 @@ func main() {
 		start := time.Now()
 		ms, err := sess.Execute(inBytes, outBytes)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "execute:", err)
+			log.Error().Err(err).Msg("execute failed")
 			os.Exit(1)
 		}
 		_ = start
@@ -107,21 +117,30 @@ func main() {
 	out := dequantizeOutput(outBytes, outScale, outOffset)
 	boxes = yolo.Postprocess(out, scale, padX, padY, srcW, srcH, float32(*conf))
 
-	fmt.Printf("inference_ms=%.2f detections=%d src=%dx%d letterbox=(%d,%d) scale=%.4f\n",
-		lastMS, len(boxes), srcW, srcH, padX, padY, scale)
+	log.Info().
+		Float64("inference_ms", lastMS).
+		Int("detections", len(boxes)).
+		Int("src_w", srcW).Int("src_h", srcH).
+		Int("pad_x", padX).Int("pad_y", padY).
+		Float32("scale", scale).
+		Msg("inference done")
 	dets := make([]detOut, 0, len(boxes))
 	for _, b := range boxes {
 		dets = append(dets, detOut{b.X1, b.Y1, b.X2, b.Y2, b.Score, b.Class, b.ClassName})
-		fmt.Printf("  %-16s score=%.3f box=(%.3f, %.3f, %.3f, %.3f)\n",
-			b.ClassName, b.Score, b.X1, b.Y1, b.X2, b.Y2)
+		log.Info().
+			Str("class", b.ClassName).
+			Float32("score", b.Score).
+			Float32("x1", b.X1).Float32("y1", b.Y1).
+			Float32("x2", b.X2).Float32("y2", b.Y2).
+			Msg("detection")
 	}
 	if j, err := json.Marshal(dets); err == nil {
-		fmt.Printf("json=%s\n", j)
+		log.Info().Str("json", string(j)).Msg("detections")
 	}
 
 	if *outPath != "" {
 		if err := drawBoxes(*imagePath, *outPath, boxes); err != nil {
-			fmt.Fprintln(os.Stderr, "draw:", err)
+			log.Error().Err(err).Msg("draw failed")
 		}
 	}
 }

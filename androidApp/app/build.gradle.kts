@@ -60,6 +60,8 @@ dependencies {
     implementation(libs.miuix.ui)
     implementation(libs.miuix.preference)
     implementation(libs.miuix.icons)
+    // miuix 0.9.3 的弹窗/返回手势依赖 navigationevent，需要显式提供 dispatcher owner
+    implementation(libs.androidx.navigationevent.compose)
 
     // Snapdragon QNN HTP：官方已验证组合（Ultralytics Flutter 插件同款）
     // 1. onnxruntime-android-qnn：monolithic QNN EP 的 ORT Android 构建

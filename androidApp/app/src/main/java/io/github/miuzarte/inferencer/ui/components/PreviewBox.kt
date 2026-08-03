@@ -71,6 +71,14 @@ fun PreviewBox(
                     .background(Color(0xAA000000))
                     .padding(horizontal = 4.dp, vertical = 2.dp),
             )
+            Text(
+                text = "DET: ${detections.size}",
+                color = Color.White,
+                fontSize = 12.sp,
+                modifier = Modifier
+                    .background(Color(0xAA000000))
+                    .padding(horizontal = 4.dp, vertical = 2.dp),
+            )
         }
     }
 }

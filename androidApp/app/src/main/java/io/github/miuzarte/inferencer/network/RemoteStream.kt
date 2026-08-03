@@ -78,6 +78,9 @@ class RemoteStream(
         }
 
         override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+            // disconnect() 后 executor 已关闭，OkHttp 回调可能还会带着残留消息过来，
+            // 此时直接丢弃，避免 RejectedExecutionException 污染连接状态。
+            if (closed || executor.isShutdown) return
             // 跳帧：上一帧还在推理时直接丢弃新帧，避免堆积
             if (processing.compareAndSet(false, true)) {
                 executor.execute { handleFrame(bytes.toByteArray()) }
@@ -118,6 +121,7 @@ class RemoteStream(
             }
             webSocket?.send(json.toString())
 
+            Log.v(TAG, "dets=${dets.size} frame=$frameId infer=%.1fms".format(ms))
             onFrame(frameId, bitmap)
             onDetections(dets)
             onInferenceMs(ms)

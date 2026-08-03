@@ -2,7 +2,6 @@ package io.github.miuzarte.inferencer.ui.viewmodel
 
 import android.app.Application
 import android.graphics.Bitmap
-import android.graphics.Canvas
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -26,7 +25,6 @@ class DetectorViewModel(application: Application) : AndroidViewModel(application
 
     private var model: QnnYoloModel? = null
     private var stream: RemoteStream? = null
-    private val canvasBitmap = Bitmap.createBitmap(640, 640, Bitmap.Config.ARGB_8888)
 
     val selectedModel = MutableStateFlow(ModelRepository.models.first())
     val remoteUrl = MutableStateFlow("ws://192.168.1.100:9090/stream")
@@ -124,9 +122,9 @@ class DetectorViewModel(application: Application) : AndroidViewModel(application
             },
             onFrame = { _, bmp ->
                 viewModelScope.launch {
-                    Canvas(canvasBitmap).drawBitmap(bmp, 0f, 0f, null)
-                    bmp.recycle()
-                    _displayBitmap.value = canvasBitmap
+                    // 直接投递新解码的 Bitmap：每帧都是新引用，StateFlow 才会通知 UI 更新。
+                    // 不能提前 recycle，Image 绘制期间仍持有它（交给 GC 回收）。
+                    _displayBitmap.value = bmp
                 }
             },
             onDetections = { _detections.value = it },
