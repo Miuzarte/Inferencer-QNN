@@ -10,9 +10,16 @@ package qnn
 import "C"
 
 import (
+	"errors"
 	"fmt"
 	"unsafe"
+
+	"Inferencer/qnn/perf"
 )
+
+// ErrPerfUnsupported 表示后端/设备不提供 HTP 性能基础设施。
+// 调用方应把它当作"降级继续跑", 而不是启动失败。
+var ErrPerfUnsupported = errors.New("HTP performance infrastructure not supported")
 
 // Session 封装一个 QNN HTP 会话（backend + device + context + graph）。
 type Session struct {
@@ -109,4 +116,96 @@ func (s *Session) Close() {
 		C.qnn_destroy(s.c)
 		s.c = nil
 	}
+}
+
+// PerfInit 请求 HTP 性能基础设施并创建 power config id。
+//
+// 必须在 Create 之后、LoadBinary 之前调用 (与 QIDK 的
+// deviceCreate -> perf -> contextCreate 顺序一致)。
+// 返回 ErrPerfUnsupported 表示设备/后端不支持, 应降级继续。
+func (s *Session) PerfInit() error {
+	if s == nil || s.c == nil {
+		return fmt.Errorf("session closed")
+	}
+	switch rc := C.qnn_perf_init(s.c); rc {
+	case 0:
+		return nil
+	case -2:
+		return fmt.Errorf("%w: %s", ErrPerfUnsupported, C.GoString(C.qnn_last_error()))
+	default:
+		return fmt.Errorf("qnn_perf_init: %s", C.GoString(C.qnn_last_error()))
+	}
+}
+
+// PerfStatus 返回性能基础设施状态。ok 为 false 表示未初始化或不可用。
+func (s *Session) PerfStatus() (infraType int, powerConfigID uint32, ok bool) {
+	if s == nil || s.c == nil {
+		return 0, 0, false
+	}
+	var it C.int
+	var pid C.uint
+	if C.qnn_perf_status(s.c, &it, &pid) == 0 {
+		return 0, 0, false
+	}
+	return int(it), uint32(pid), true
+}
+
+// PerfApply 下发性能档位, 可反复调用换档。
+//
+// degraded 为 true 表示整组被拒后退化为只下发 DCVS_V3 (例如本 HTP 版本不支持
+// RPC_POLLING_TIME)。cfg 没有任何配置项时是空操作 (用于 default 基线档)。
+func (s *Session) PerfApply(cfg perf.Config) (degraded bool, err error) {
+	if s == nil || s.c == nil {
+		return false, fmt.Errorf("session closed")
+	}
+	if !cfg.HasAny() {
+		return false, nil
+	}
+	c := C.qnn_power_cfg{
+		power_mode:          C.int(cfg.PowerMode),
+		dcvs_enable:         C.int(cfg.DcvsEnable),
+		sleep_latency:       C.int(cfg.SleepLatency),
+		sleep_disable:       C.int(cfg.SleepDisable),
+		bus_vc_min:          C.int(cfg.BusMin),
+		bus_vc_target:       C.int(cfg.BusTarget),
+		bus_vc_max:          C.int(cfg.BusMax),
+		core_vc_min:         C.int(cfg.CoreMin),
+		core_vc_target:      C.int(cfg.CoreTarget),
+		core_vc_max:         C.int(cfg.CoreMax),
+		rpc_control_latency: C.int(cfg.RpcControlLatency),
+		rpc_polling_time:    C.int(cfg.RpcPollingTime),
+	}
+	switch rc := C.qnn_perf_apply(s.c, &c); rc {
+	case 0:
+		return false, nil
+	case 1:
+		return true, nil
+	case -2:
+		return false, fmt.Errorf("%w: %s", ErrPerfUnsupported, C.GoString(C.qnn_last_error()))
+	default:
+		return false, fmt.Errorf("qnn_perf_apply: %s", C.GoString(C.qnn_last_error()))
+	}
+}
+
+// PlatformInfo 查询平台信息 (HTP 架构/SOC/VTCM/核数)。
+// 返回的 PlatformInfo.Valid 为 false 表示该后端不提供此信息, 不算错误。
+func (s *Session) PlatformInfo() (perf.PlatformInfo, error) {
+	if s == nil || s.c == nil {
+		return perf.PlatformInfo{}, fmt.Errorf("session closed")
+	}
+	var ci C.qnn_plat_info
+	if rc := C.qnn_platform_info(s.c, &ci); rc != 0 {
+		return perf.PlatformInfo{}, fmt.Errorf("qnn_platform_info: %s", C.GoString(C.qnn_last_error()))
+	}
+	return perf.PlatformInfo{
+		Valid:      ci.valid != 0,
+		Arch:       int(ci.arch),
+		SocModel:   int(ci.soc_model),
+		VtcmMB:     int(ci.vtcm_mb),
+		SignedPD:   ci.signed_pd != 0,
+		Dlbc:       ci.dlbc != 0,
+		DevType:    int(ci.dev_type),
+		NumDevices: int(ci.num_devices),
+		NumCores:   int(ci.num_cores),
+	}, nil
 }

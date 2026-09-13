@@ -207,6 +207,41 @@ func ArgmaxU16(out []byte, conf, scale float32) []Candidate {
 	return cands
 }
 
+// ArgmaxU16Class 只对指定类别求最大; classID < 0 或越界时退化为全类别扫描。
+//
+// person-only 时只读该类别的分数行 (8400 个 uint16 = 16.8KB), 不像 ArgmaxU16
+// 那样把 84 行全扫一遍 (1.4MB, 且是跨行跨步访问); 坐标只在分数过阈值时才读。
+func ArgmaxU16Class(out []byte, conf, scale float32, classID int) []Candidate {
+	if classID < 0 || classID >= NumClasses {
+		return ArgmaxU16(out, conf, scale)
+	}
+	const anchors = 8400
+	if len(out) < OutFeatures*anchors*2 {
+		return nil
+	}
+	w := anchors
+	thresh := uint16(conf/scale) + 1 // best*scale < conf 等价于 best < conf/scale
+	row := (classID + 4) * w
+	var cands []Candidate
+	for i := 0; i < w; i++ {
+		o := (row + i) * 2
+		best := uint16(out[o]) | uint16(out[o+1])<<8
+		if best < thresh {
+			continue
+		}
+		cx := float32(uint16(out[i*2])|uint16(out[i*2+1])<<8) * scale
+		cy := float32(uint16(out[(w+i)*2])|uint16(out[(w+i)*2+1])<<8) * scale
+		bw := float32(uint16(out[(2*w+i)*2])|uint16(out[(2*w+i)*2+1])<<8) * scale
+		bh := float32(uint16(out[(3*w+i)*2])|uint16(out[(3*w+i)*2+1])<<8) * scale
+		cands = append(cands, Candidate{
+			X1: cx - bw/2, Y1: cy - bh/2,
+			X2: cx + bw/2, Y2: cy + bh/2,
+			Score: float32(best) * scale, Class: classID,
+		})
+	}
+	return cands
+}
+
 // NMS 按分数降序做全局 NMS。
 func NMS(cands []Candidate, iou float32) []Candidate {
 	sort.Slice(cands, func(i, j int) bool { return cands[i].Score > cands[j].Score })

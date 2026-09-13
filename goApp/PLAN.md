@@ -221,3 +221,242 @@ export ADSP_LIBRARY_PATH=$PREFIX/lib
   生成 `ctx_v73.bin` 提交到仓库（3MB 内可接受）。
 - **Termux 进程被杀**：前台 `termux-wake-lock`；SSH 会话断开用 tmux 保持。
 - **温控**：与 androidApp 相同，验证后立即 stop。
+
+## 6. P4: HTP 执行延迟调优 (2026-09-13 完成)
+
+### 结论
+
+`execute` 从 **14.8ms 降到 5.5ms (-63%)**: 之前的 14.8ms **不是算子本身的开销**,
+而是"从来没有给 HTP 投过性能票", DSP 一直跑在 DCVS 默认(低频)档上。加上
+`QnnDevice_getInfrastructure` → `createPowerConfigId` → `setPowerConfig`
+之后就下来了, 手机端入口是 `cmd/streamer -htp-perf <档位>`。
+
+### 为什么是它
+
+当时的账本 (小米13, 30fps 源, 640x640 JPEG ~50KB, 串行 + `-affinity 7`):
+
+```
+latency 29.1ms = net 8.0 (链路+PC, 已到底) + cpu 6.3 (手机 CPU, 已压过) + execute 14.8
+```
+
+`qnn/bridge.c` 当时只设了 `QNN_HTP_DEVICE_CONFIG_OPTION_ARCH`,
+性能档 / DVFS / fastrpc 延迟参数一个都没下发。
+
+### 已核对的事实 (qnn-headers = QNN 2.46, API 2.35)
+
+**调用链** (`QnnDevice.h:354` 声明, 实现在 `QnnInterface.h:565` 的 vtable):
+
+```
+deviceCreate -> iface.deviceGetInfrastructure(&infra)
+             -> (QnnHtpDevice_Infrastructure_t*)infra->perfInfra.createPowerConfigId(0, 0, &id)
+             -> perfInfra.setPowerConfig(id, NULL 结尾的配置数组)
+```
+
+- 头文件签名写作 `const QnnDevice_Infrastructure_t*` (= `_t**`), 是 SDK 的 const
+  写法怪癖; 厂商实现一律 `QnnDevice_Infrastructure_t infra = NULL; iface.deviceGetInfrastructure(&infra);`
+- `dcvsV3Config.contextId` 填 `createPowerConfigId` 返回的 id (不是 0) — QIDK /
+  onnxruntime-qnn / ai-engine-direct-helper 三家实现完全一致
+- `setPowerConfig` 可反复调用换档 (QIDK 就是这么在运行时切 profile 的)
+- 投票是**进程级且不可撤销**: 一旦投过票, "不下发" 的 default 就回不去
+- `RPC_POLLING_TIME` 仅 V69+, 作用于整个进程, 上限 9999us (`QnnHtpPerfInfrastructure.h:381`)
+- 电压角 MAX=0xA0 / TURBO=0x80 / NOM_PLUS=0x70 / SVS=0x40; sleepLatency 40(最短)/100/1000/2000us
+
+**厂商参考实现** (语义一致):
+- `B:\Git\qidk\...\YoloNas\app\src\main\cpp\src\inference.cpp:69-238` (Qualcomm 自己的档位表)
+- `B:\Git\onnxruntime-qnn\...\qnn_htp_power_config_manager.cc` + `qnn_def.h:162-170`
+- `B:\Git\ai-engine-direct-helper\src\QnnInferenceEngine.cpp:57-181, 2120-2152`
+
+**明确排掉、不要浪费时间的方向**:
+- Context 的 `INIT_ACCELERATION` 只加速**反序列化/加载** (`QnnHtpContext.h:175-180`),
+  **与每帧延迟无关**; `USE_EXTENDED_UDMA` 仅 v81+; `SKIP_VALIDATION_ON_BINARY_SECTION`
+  只对 LoRA 生效 → 原计划里的"试 context 选项"作废
+- Device 的 `SOC`/`SECUREPD`/`SIGNEDPD` (`QnnHtpDevice.h:71-77`) 不是延迟旋钮
+- `DDR_PERF_MODE` 要 V81 + LLM + RPC polling 同时满足; `HMX_V2`/`CENG`/
+  `ADAPTIVE_POLLING_TIME` 在 v73 上无意义 → 留给换小米 17 (v81) 时再开
+
+### 工具与测量纪律
+
+- `cmd/htpbench`: 单进程内**轮询**多档位 (default -> burst -> ... -> default -> ...),
+  按 `-interval 33ms` 复现真实占空比。背靠背测会让 DSP 一直醒着, 掩盖休眠唤醒成本。
+  纯 default 跑法 (`-profiles default -rounds N`) 能拿到完整时间序列看热衰减。
+- **只看平均值**: 单帧噪声 ±3ms
+- **成对交替**: 同一配置跨时段能差 3ms (手机 CPU 段 5.7~10.6ms, worker 核 0.86~1.6GHz)
+- 口径: `htpbench` 的 execute = `graphExecute` 的 wall time, 与 PC 的
+  `stream_inference_ms` 同义
+
+### 实测 (小米13, HTP v73, arch=73 soc=43 vtcm=8MB, 非 root)
+
+`htpbench` 单进程轮询 (3 轮 x 120 帧, 33ms 占空比):
+
+| 档位 | execute avg | vs default |
+|---|---|---|
+| `default` (不下发) | 15.81ms | — |
+| `burst` | **5.80ms** | **-63.3%** |
+| `burst_nosleep` | 5.73ms | -63.7% |
+| `sustained_high_performance` | 6.04ms | -61.8% |
+| `balanced` | 7.34ms | -53.6% |
+| `power_saver` | 11.22ms | -29.1% |
+
+- 单调性 (`power_saver` 比 default 还慢) 证明这是真实频率效应, 不是噪声
+- 4 个全新进程复测一致: default 15.59/15.52ms, burst 5.67ms
+- 背靠背 burst 5.07ms vs 33ms 下 5.67ms → 每帧约 0.6ms 休眠唤醒成本,
+  远小于不投票损失的 ~10ms (后者是频率差)
+- `sleepDisable` 几乎无差别 (burst 5.80 vs burst_nosleep 5.73), 收益全在电压角
+
+端到端 (真实 `cmd/streamer` + 协议喂帧器 30fps/122KB 帧, 3 对交替, 每腿 42s):
+
+| leg | 档位 | execute | decode | quant | read | 首窗->末窗 |
+|---|---|---|---|---|---|---|
+| A1/A2/A3 | `default` | 14.81/14.71/14.79 | 4.8/4.5/4.8 | 3.2/3.0/3.2 | 10.0/10.7/10.2 | 稳定 |
+| B1/B2/B3 | `burst` | **5.47/5.47/5.47** | 3.4/3.3/3.3 | 2.2/2.2/2.2 | 22.1/22.2/22.2 | 稳定 |
+
+- `execute` 14.77±0.04 -> 5.47±0.00, 三对完全一致
+- `read` 10.2 -> 22.2ms: 手机端余量翻倍
+- CPU 段也跟着快了 (decode 4.7->3.3, quant 3.1->2.2): 不投票时线程长时间阻塞在
+  fastrpc 上, CPU 频率被压下去; 投票把整机状态带起来后 CPU 段也受益
+
+长局热稳定 (每档连续 4 分钟 = 8 个 30s 温度采样 / 52 个 5s execute 窗口, 30fps):
+
+| 档位 | execute 逐窗范围 | 均值 | 首窗 -> 末窗 | fps | read |
+|---|---|---|---|---|---|
+| `default` | 14.03 ~ 14.94 | 14.72 | 14.75 -> 14.65 | 30 | 10.2 |
+| `burst` | 5.43 ~ 5.51 | **5.47** | 5.48 -> 5.48 | 30 | 22.4 |
+| `sustained_high_performance` | 5.79 ~ 5.87 | 5.84 | 5.86 -> 5.83 | 30 | 22.1 |
+
+**没有任何热衰减**: burst 连续 4 分钟稳定在 5.47±0.03, fps 恒定 30, 无一帧丢失。
+温度采样 (`/sys/class/thermal/thermal_zone*/temp`, 30s 一次) 也说明这份负载很轻:
+DSP (`nspss-*`) 从 46-47C 升到 49-50C (+3C), CPU (`cpuss-*`/`cpu-1-*`) 50-51C,
+`battery` 41-42C, `quiet_therm` 44C, `ddr` 46-48C — 离任何热关都不近。
+真机长局 (>=30min) 的功耗/温度代价仍未量化, 但 4 分钟看不到拐点。
+
+### 旋钮隔离 (哪个参数真正在起作用)
+
+同一进程内轮换 (`-rounds 3 -iters 120 -interval 33ms`, burst 基准 5.80ms):
+
+| 配置 | execute | 结论 |
+|---|---|---|
+| `burst` (rpcPolling=9999, rpcLatency=100) | 5.79 ~ 5.80 | 基准 |
+| `burst -rpc-polling-time 0` | **6.24** | polling 值 **0.44ms** (V69+ 才有的参数, 确实有用) |
+| `burst -rpc-control-latency 0` | 5.78 | `RPC_CONTROL_LATENCY` 在本机 **无效果** (噪声内) |
+| `burst -rpc-control-latency 0 -rpc-polling-time 0` | 6.27 | 与只去掉 polling 一致 |
+| `burst_nosleep` (两者都 0) | 6.30 | `sleepDisable` 仍无差别 |
+
+即: **收益几乎全在 DCVS_V3 的电压角 + polling**, 其余旋钮可以不动。
+
+### 数值结果不变 (无检测回归)
+
+`htpbench -hash-output` (默认开) 对输出张量做 FNV-1a 64: `default` / `burst` /
+`sustained_high_performance` / `burst_nosleep` 在同一输入下哈希**完全相同**
+(`9be3fc3889d96fc7`), 且同档位跨轮次也一致 → 投票只改频率/电压, 不改变数值结果,
+不存在精度回归风险 (也不需要重跑检测正确性对比)。
+
+### 最终默认
+
+`scripts/run_device.sh` 的默认档位改成 **`burst`** (实测最快且 4 分钟无衰减);
+`STREAM_HTP_PERF=default` 退回不投票, `sustained_high_performance` 是保守档
+(只慢 0.37ms, 用 TURBO 角而不是 MAX 角, 长局若发现耗电/发热明显就换它)。
+
+### 方法论事故 (必须记住)
+
+1. **小米13 上 `pgrep -x` / `pkill -x` 一个进程都匹配不到**: `/proc/<pid>/comm`
+   不可读, procps 静默返回空。第一次跑 A/B 时 `pkill -x streamer` 从未生效,
+   6 条腿全部并发、6 个 QNN 会话抢同一个 HTP, 测出 `execute` 65ms 的**完全相反的
+   结论**。杀进程必须 `pgrep -f '^\./streamer'` + `kill -9`, 或直接记 `$!`;
+   每条腿跑之前断言残留进程数为 0。`scripts/build_android.ps1` 的 push 前置检查
+   已按此改。
+2. **`build_android.ps1` 设置的 `GOOS`/`GOARCH`/`CGO_ENABLED` 是进程级的且不还原**,
+   同一条命令里接着跑 `go test` 会尝试执行 android 产物并报
+   `%1 is not a valid Win32 application`。
+3. **`cmd/htpbench` 必须在结尾 `os.Exit`**: Termux 下正常 `return` 会让 QNN/厂商库的
+   atexit 清理触发 SIGABRT (`signal arrived during cgo execution`), 与
+   `cmd/streamer` 同一个坑。
+
+### 下一步 (按收益排序, 都还没做)
+
+1. **PC metrics 上的精确 latency 复测**: 本次端到端用的是协议喂帧器 (wstest), 只拿到
+   手机侧分段; 有了 `burst` 之后应重跑一次带真游戏的 A/B, 用
+   `stream_latency_avg_ms` / `stream_network_avg_ms` 把 29.1ms 的新值钉下来。
+   注意 PC 端 streamer 在游戏非前台时会降到 `FpsIdle=2` (硬编码在 `main.go:474`),
+   喂不出 30fps, 必须游戏在前台。
+2. **长局 (>=30min) 热稳定**: 4 分钟没衰减, 但真实对局更长, 且 `burst` 把 DSP 钉在
+   MAX 电压角, 功耗/温度代价还没量化 (手机电池/pa 温度可读, `/sys/class/thermal`)。
+   若长局衰减明显, 退到 `sustained_high_performance` (TURBO 角, 只慢 0.24ms)。
+3. **张量 I/O 零拷贝 (Phase 2)**: 现在 tensor 是 `QNN_TENSORMEMTYPE_RAW` + 普通
+   Go 堆缓冲, 每次 execute 都要把 2.4MB 输入 + 1.4MB 输出经 fastrpc 往返。可行做法是
+   `libcdsprpc.so` 的 `rpcmem_alloc/free/to_fd` 分配 dma-buf -> `mmap` ->
+   `QnnMem_register(QNN_HTP_MEM_SHARED_BUFFER, fd, offset)` 拿 `Qnn_MemHandle_t`
+   -> tensor 改 `QNN_TENSORMEMTYPE_MEMHANDLE`。**先探测再实现**。
+   注意现在 `execute` 已经只有 5.5ms, 这条的收益上限也变小了。
+4. **重生成 ctx binary (Phase 3)**: 改 `VTCM_SIZE`/`NUM_HVX_THREADS`/`NUM_CORES`
+   必须重走 preparation。SDK 已经齐了 (`tmp/qairt-2.46.0.260424.zip` 里有
+   `lib/aarch64-android/libQnnHtpPrepare.so`、`bin/x86_64-windows-msvc/qairt-converter`
+   与 `qnn-context-binary-generator`), 唯一外部依赖是重新下载
+   `yolo26n_v73_qnn.onnx` (仓库不存 onnx)。
+5. **换小米 17 (v81) —— 环境已就绪 (2026-09-13)**: 见 §7。
+
+### 环境事实 (别丢)
+
+- **两台机器都可用, `run.sh` 一字不差, 差异只在 `~/streamer/device.env`**:
+
+  | | 小米13 (备用) | 小米17 (主力) |
+  |---|---|---|
+  | Termux ssh | `192.168.1.103:8022`, 用户 `u0_a441` | `192.168.1.102:8022`, 用户 `u0_a352` |
+  | `device.env` | 无需 (默认 v73) | `STREAM_ARCH=81` / `STREAM_CTX=models/ctx_v81.bin` |
+  | 平台 | `arch=73 soc=43 vtcm=8MB` | `arch=81 soc=87 vtcm=8MB` |
+  | `execute` 不投票 -> burst | 15.8 -> 5.47ms | 16.6 -> **3.32ms** |
+  | adb 序列号 | `9b4a818` | (未连) |
+  | `run.sh` 版本 | 旧版 (默认已经写死 v73, 功能等价; 等 13 开机后 `scp scripts/run_device.sh 192.168.1.103:~/streamer/run.sh` 对齐) | 与仓库 md5 一致 |
+
+  两边目录都是 `~/streamer/{streamer, htpbench, run.sh, device.env, models/ctx_v*.bin, bus.jpg}`
+- 部署: `scripts/build_android.ps1 [-Cmd ./cmd/xxx -Out tmp/xxx -RemoteName xxx] [-Push]`;
+  **push 前必须先杀掉运行中的同名进程** (覆盖运行中的可执行文件会 ETXTBSY 静默失败),
+  脚本内置的前置检查用 `pgrep -f '^\./name'`
+- 库部署: `bash setup_libs.sh -a <73|81> [-q <QNN库目录>]` (递归解析 vendor 依赖,
+  见 §7 的两个反向坑)
+- PC 跑法: `.\streamer.exe -autodisplay -game=r6s -mhub-addr 127.0.0.1:9000 -noyolo`
+  (metrics 在 `:8080/metrics`); 手机: `cd ~/streamer && ./run.sh`
+  (档位用 `STREAM_HTP_PERF=burst ./run.sh`)
+- 没有游戏在前台时, 用 `tmp/wstest` (仓库外, 见 `.gitignore` 的 `tmp/`) 作喂帧器:
+  `go build -o tmp/wstest.exe ./tmp/wstest` 然后
+  `tmp/wstest.exe -addr :9090 -img tmp/bus.jpg -fps 30 -quality 80`, 手机照常 `run.sh`
+
+## 7. 小米17 (HTP v81 / Android 16) 环境落地 (2026-09-13)
+
+`192.168.1.102:8022`, 同样的 `~/streamer` 布局, 同样的 `run.sh`。做完的验证:
+真机 `run.sh` 跑通 (30fps / 122KB 帧): `execute 3.32ms`、`decode 2.0`、`quant 2.9`、
+`read 25.3`、fps 29.6~29.8、`dropped=0`、`pinned worker thread mask=128` (CPU7)。
+
+档位表 (同一套 `htpbench`, 33ms 占空比):
+
+| 档位 | 小米13 (v73) | 小米17 (v81) |
+|---|---|---|
+| `default` | 15.81ms | 16.57ms |
+| `burst` | 5.80ms | **3.53ms** |
+| `burst_nosleep` | 5.73ms | 3.54ms |
+| `sustained_high_performance` | 6.04ms | 4.05ms |
+| `balanced` | 7.34ms | 4.96ms |
+| `power_saver` | 11.22ms | 7.65ms |
+
+规律完全一致 (单调、`power_saver` 仍慢于 default、7 个档位输出哈希相同
+`01c5745fa9a9bcdd`), 只是绝对值更低。
+
+### 与 Android 13 不同的两个坑 (都已修进 `setup_libs.sh`)
+
+1. **漏复制**: Android 16 的 `/vendor/lib64/libcdsprpc.so` 除了
+   `vendor.qti.hardware.dsp@1.0.so`, 还 NEEDED 一个 AIDL NDK 变体
+   `vendor.qti.hardware.dsp-V1-ndk.so`。手工清单必漏, 症状是
+   `dlopen libcdsprpc.so: dlopen failed: library "vendor.qti.hardware.dsp-V1-ndk.so" not found`。
+2. **多复制 (更阴)**: `/system/lib64` 里已有的 soname **绝对不能**复制到
+   `$PREFIX/lib`。`LD_LIBRARY_PATH` 优先, vendor 那份 `libc++.so` 会遮蔽系统版本,
+   然后炸在**别的**库上:
+   `CANNOT LINK EXECUTABLE: cannot locate symbol "_ZNSt3__113__hash_memoryEPKvm" referenced by "/system/lib64/liblog.so"`。
+   `setup_libs.sh` 现在对 `/system/lib64` 已有的 soname 既不复制也不递归, 并对残留的
+   遮蔽副本打印 `rm` 建议。
+
+另外: 真实设备上 `-arch` 会被 QNN 忽略 (日志明说 `Specified config ARCH, ignoring on
+real target`), 实际架构由 ctx binary 决定; 所以二进制**不用为换机重编**, 同一个
+arm64 产物两台通用。
+
+v81 上还没试的旋钮 (head 文件里有, 留给下一轮): `DDR_PERF_MODE` (要 V81 + polling +
+官方说仅 LLM 场景)、`ADAPTIVE_POLLING_TIME`、`HMX_V2`/`CENG` (这代才有意义)。
+

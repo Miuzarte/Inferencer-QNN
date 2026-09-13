@@ -58,6 +58,13 @@ struct qnn_session {
   uint32_t num_in;
   uint32_t num_out;
   int verbose;
+
+  // HTP 性能基础设施 (qnn_perf_init 之后有效)
+  QnnHtpDevice_PerfInfrastructure_t perf_infra;
+  int has_perf_infra;
+  int infra_type;
+  uint32_t power_config_id;
+  int power_config_valid;
 };
 
 static __thread char g_err[512];
@@ -297,6 +304,190 @@ fail:
   return NULL;
 }
 
+// ---- HTP 性能基础设施 (power config) ----
+//
+// 调用链与厂商实现一致 (QIDK inference.cpp:321-343, ai-engine-direct-helper
+// QnnInferenceEngine.cpp:2120-2152):
+//   deviceCreate -> deviceGetInfrastructure -> createPowerConfigId(0, 0, &id) -> setPowerConfig
+//
+// 返回值约定: 0 = 成功; 1 = 已应用但降级 (部分配置项被拒); -2 = 不支持; -1 = 失败。
+
+int qnn_perf_init(qnn_session_t* s) {
+  if (!s) {
+    qnn_set_error("invalid args to qnn_perf_init");
+    return -1;
+  }
+  if (s->has_perf_infra) return 0;
+  if (!s->device) {
+    qnn_set_error("qnn_perf_init: device not created");
+    return -1;
+  }
+  if (!s->iface.deviceGetInfrastructure) {
+    qnn_set_error("this backend does not export deviceGetInfrastructure");
+    return -2;
+  }
+
+  QnnDevice_Infrastructure_t infra = NULL;
+  Qnn_ErrorHandle_t rc = s->iface.deviceGetInfrastructure(&infra);
+  if (rc != QNN_SUCCESS || !infra) {
+    qnn_set_error("QnnDevice_getInfrastructure failed: error %d", (int)rc);
+    return (int)rc == (int)QNN_DEVICE_ERROR_UNSUPPORTED_FEATURE ? -2 : -1;
+  }
+
+  QnnHtpDevice_Infrastructure_t* htp = (QnnHtpDevice_Infrastructure_t*)infra;
+  s->infra_type = (int)htp->infraType;
+  // onnxruntime-qnn 也做这个校验 (qnn_htp_power_config_manager.cc:138)
+  if (htp->infraType != QNN_HTP_DEVICE_INFRASTRUCTURE_TYPE_PERF) {
+    qnn_set_error("unexpected HTP infraType %d (want PERF=%d)", (int)htp->infraType,
+                  (int)QNN_HTP_DEVICE_INFRASTRUCTURE_TYPE_PERF);
+    return -2;
+  }
+  if (!htp->perfInfra.createPowerConfigId) {
+    qnn_set_error("perfInfra.createPowerConfigId is NULL");
+    return -2;
+  }
+
+  s->perf_infra = htp->perfInfra;
+  s->has_perf_infra = 1;
+  rc = s->perf_infra.createPowerConfigId(0, 0, &s->power_config_id);
+  if (rc != QNN_SUCCESS) {
+    qnn_set_error("createPowerConfigId(0, 0) failed: error %d", (int)rc);
+    s->has_perf_infra = 0;
+    return -1;
+  }
+  s->power_config_valid = 1;
+  qnn_log(s, "perf: infraType=%d powerConfigId=%u", s->infra_type, s->power_config_id);
+  return 0;
+}
+
+int qnn_perf_status(const qnn_session_t* s, int* infra_type, unsigned* power_config_id) {
+  if (!s) return 0;
+  if (infra_type) *infra_type = s->infra_type;
+  if (power_config_id) *power_config_id = s->power_config_id;
+  return s->power_config_valid ? 1 : 0;
+}
+
+int qnn_perf_apply(qnn_session_t* s, const qnn_power_cfg* cfg) {
+  if (!s) {
+    qnn_set_error("invalid args to qnn_perf_apply");
+    return -1;
+  }
+  if (!cfg) return 0;
+  if (!s->has_perf_infra || !s->power_config_valid) {
+    qnn_set_error("perf infrastructure not initialized");
+    return -2;
+  }
+
+  QnnHtpPerfInfrastructure_PowerConfig_t dcvs;
+  QnnHtpPerfInfrastructure_PowerConfig_t rpc_lat;
+  QnnHtpPerfInfrastructure_PowerConfig_t rpc_poll;
+  memset(&dcvs, 0, sizeof(dcvs));
+  memset(&rpc_lat, 0, sizeof(rpc_lat));
+  memset(&rpc_poll, 0, sizeof(rpc_poll));
+
+  const QnnHtpPerfInfrastructure_PowerConfig_t* cfgs[4];
+  int n = 0;
+
+  if (cfg->power_mode != 0) {
+    dcvs.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_DCVS_V3;
+    QnnHtpPerfInfrastructure_DcvsV3_t* d = &dcvs.dcvsV3Config;
+    // 三份厂商实现 (QIDK / ORT / ai-engine-direct-helper) 都把 contextId 填成
+    // createPowerConfigId 返回的 id, 不是 0
+    d->contextId = s->power_config_id;
+    d->setDcvsEnable = 1;
+    d->dcvsEnable = (uint32_t)cfg->dcvs_enable;
+    d->powerMode = (QnnHtpPerfInfrastructure_PowerMode_t)cfg->power_mode;
+    d->setSleepLatency = 1;
+    d->sleepLatency = (uint32_t)cfg->sleep_latency;
+    d->setSleepDisable = 1;
+    d->sleepDisable = (uint32_t)cfg->sleep_disable;
+    d->setBusParams = 1;
+    d->busVoltageCornerMin = (QnnHtpPerfInfrastructure_VoltageCorner_t)cfg->bus_vc_min;
+    d->busVoltageCornerTarget = (QnnHtpPerfInfrastructure_VoltageCorner_t)cfg->bus_vc_target;
+    d->busVoltageCornerMax = (QnnHtpPerfInfrastructure_VoltageCorner_t)cfg->bus_vc_max;
+    d->setCoreParams = 1;
+    d->coreVoltageCornerMin = (QnnHtpPerfInfrastructure_VoltageCorner_t)cfg->core_vc_min;
+    d->coreVoltageCornerTarget = (QnnHtpPerfInfrastructure_VoltageCorner_t)cfg->core_vc_target;
+    d->coreVoltageCornerMax = (QnnHtpPerfInfrastructure_VoltageCorner_t)cfg->core_vc_max;
+    cfgs[n++] = &dcvs;
+  }
+  if (cfg->rpc_control_latency >= 0) {
+    rpc_lat.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_CONTROL_LATENCY;
+    rpc_lat.rpcControlLatencyConfig = (QnnHtpPerfInfrastructure_RpcControlLatency_t)cfg->rpc_control_latency;
+    cfgs[n++] = &rpc_lat;
+  }
+  if (cfg->rpc_polling_time >= 0) {
+    rpc_poll.option = QNN_HTP_PERF_INFRASTRUCTURE_POWER_CONFIGOPTION_RPC_POLLING_TIME;
+    rpc_poll.rpcPollingTimeConfig = (QnnHtpPerfInfrastructure_RpcPollingTime_t)cfg->rpc_polling_time;
+    cfgs[n++] = &rpc_poll;
+  }
+  if (n == 0) return 0;
+  cfgs[n] = NULL;
+
+  Qnn_ErrorHandle_t rc = s->perf_infra.setPowerConfig(s->power_config_id, cfgs);
+  if (rc == QNN_SUCCESS) {
+    qnn_log(s, "perf: applied %d config(s) on id=%u", n, s->power_config_id);
+    return 0;
+  }
+
+  // 整组被拒时退化为只发 DCVS_V3 (常见原因: 本 HTP 版本不支持 RPC_POLLING_TIME)
+  if (n > 1 && cfgs[0] == &dcvs) {
+    const QnnHtpPerfInfrastructure_PowerConfig_t* only[2] = {&dcvs, NULL};
+    Qnn_ErrorHandle_t rc2 = s->perf_infra.setPowerConfig(s->power_config_id, only);
+    if (rc2 == QNN_SUCCESS) {
+      qnn_set_error("setPowerConfig(%d configs) error %d, degraded to DCVS_V3 only", n, (int)rc);
+      return 1;
+    }
+    qnn_set_error("setPowerConfig(%d configs) error %d; DCVS_V3-only retry error %d", n, (int)rc,
+                  (int)rc2);
+    return -1;
+  }
+  qnn_set_error("setPowerConfig(%d configs) error %d", n, (int)rc);
+  return -1;
+}
+
+int qnn_platform_info(qnn_session_t* s, qnn_plat_info* out) {
+  if (!s || !out) {
+    qnn_set_error("invalid args to qnn_platform_info");
+    return -1;
+  }
+  memset(out, 0, sizeof(*out));
+  if (!s->iface.deviceGetPlatformInfo) {
+    qnn_set_error("this backend does not export deviceGetPlatformInfo");
+    return -1;
+  }
+  const QnnDevice_PlatformInfo_t* pi = NULL;
+  Qnn_ErrorHandle_t rc = s->iface.deviceGetPlatformInfo(s->log, &pi);
+  if (rc != QNN_SUCCESS || !pi) {
+    qnn_set_error("QnnDevice_getPlatformInfo failed: error %d", (int)rc);
+    return -1;
+  }
+  if (pi->version == QNN_DEVICE_PLATFORM_INFO_VERSION_1 && pi->v1.numHwDevices > 0) {
+    const QnnDevice_HardwareDeviceInfo_t* hd = &pi->v1.hwDevices[0];
+    out->num_devices = (int)pi->v1.numHwDevices;
+    if (hd->version == QNN_DEVICE_HARDWARE_DEVICE_INFO_VERSION_1) {
+      out->num_cores = (int)hd->v1.numCores;
+      const QnnHtpDevice_DeviceInfoExtension_t* ext =
+          (const QnnHtpDevice_DeviceInfoExtension_t*)hd->v1.deviceInfoExtension;
+      if (ext) {
+        out->dev_type = (int)ext->devType;
+        out->arch = (int)ext->onChipDevice.arch;
+        out->soc_model = (int)ext->onChipDevice.socModel;
+        out->vtcm_mb = (int)ext->onChipDevice.vtcmSize;
+        out->signed_pd = ext->onChipDevice.signedPdSupport ? 1 : 0;
+        out->dlbc = ext->onChipDevice.dlbcSupport ? 1 : 0;
+      }
+    }
+  }
+  out->valid = 1;
+  qnn_log(s, "platform: devices=%d cores=%d arch=%d soc=%d vtcm=%dMB signedPd=%d dlbc=%d",
+          out->num_devices, out->num_cores, out->arch, out->soc_model, out->vtcm_mb,
+          out->signed_pd, out->dlbc);
+  // 内存归 QNN 所有, 必须还回去
+  if (s->iface.deviceFreePlatformInfo) s->iface.deviceFreePlatformInfo(s->log, pi);
+  return 0;
+}
+
 int qnn_load_binary(qnn_session_t* s, const void* bin, uint64_t size) {
   if (!s || !bin || size == 0) {
     qnn_set_error("invalid args to qnn_load_binary");
@@ -518,6 +709,7 @@ void qnn_destroy(qnn_session_t* s) {
   // 不调用 contextFree/deviceFree/backendFree：Termux 环境下
   // contextFree 会触发 SIGABRT（QNN 内部线程清理问题）。
   // 句柄随进程退出由 OS 回收；常驻进程结束时直接 os.Exit 即可。
+  // 同理不调用 perfInfra.destroyPowerConfigId：投票随进程退出自动失效。
   if (s->graph_name) free(s->graph_name);
   for (uint32_t i = 0; i < s->num_in; i++) tensor_meta_free(&s->in[i]);
   for (uint32_t i = 0; i < s->num_out; i++) tensor_meta_free(&s->out[i]);
