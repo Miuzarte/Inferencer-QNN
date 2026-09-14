@@ -169,7 +169,7 @@ cd ~/streamer && ./run.sh            # 见 scripts/run_device.sh
 | `-class` | `0` | 只回传指定类别（0=person，-1=全部） |
 | `-conf` | `0.45` | 置信度阈值 |
 | `-affinity` | `-1` | worker 线程绑定的 CPU 集合，支持 `7` / `4-7` / `4,5,6,7`（`-1`=不绑） |
-| `-pipeline` | `false` | 三段流水线（吞吐上限 ~59fps；30fps 下比串行多 ~1.1ms 延迟） |
+| `-pipeline` | `false` | 三段流水线（吞吐上限 = 1/max(CPU 前处理, NPU execute)；30fps 下比串行多 ~1.1ms 延迟） |
 | `-fastjpeg` | `true` | turbojpeg `FASTDCT\|FASTUPSAMPLE`（更快，像素略变，见下） |
 | `-argmax-all` | `false` | 后处理对全部 80 类求 argmax（默认只算 `-class` 那一类） |
 | `-compress` | `false` | permessage-deflate（帧是 JPEG，压不动，只白吃 CPU） |
@@ -300,6 +300,56 @@ CPU 50~51°C、`battery` 41~42°C、`quiet_therm` 44°C，离热关很远。所�
 杀进程必须用 `pgrep -f '^\./streamer'` + `kill -9`，或者记下 `$!` 直接杀；
 每条腿跑之前都断言残留进程数为 0。
 
+### RGB→quint16 展开用 NEON（2026-09-14，小米17，60fps 源）
+
+QNN 输入是 quint16（`scale=1/65536`、`offset=0`）的 NHWC RGB，而 turbojpeg 解出来是每通道
+1 字节，所以每帧都要把 1.2MB 展成 2.4MB。旧实现逐字节查表：
+
+```go
+for i, v := range rgb { q := quint16LUT[v]; out[i*2] = byte(q); out[i*2+1] = byte(q>>8) }
+```
+
+这一步的信息量是零，而且能化简成纯字节复制。因为
+
+```
+LUT[b] = round(b/255*65536) = b*257 + (128 <= b <= 254 ? 1 : 0)
+```
+
+（`b=255` 时 `b*257 = 65535` 正好顶到 16 位上限，那个 `+1` 被 clamp 掉了），而 `b*257`
+在小端内存里就是 `[b, b]` —— 正是 `vzip1q/vzip2q` 把向量和自身交错的结果。于是主体用
+vzip、只给 128..254 补 1（**必须排除 255**，否则低位字节进位会污染高位字节），输出逐位相同。
+
+真机上量 `cmd/streamer` 真正调用的那个包函数（3 个输出缓冲轮转，模拟流水线的冷缓存）：
+
+| 实现 | median | 加速 |
+|---|---|---|
+| 标量查表 | 1.908ms | 1.0x |
+| NEON `vzip` + 精确修正 | **0.126ms** | **15.1x** |
+
+60fps 现场 A/B（`-pipeline -affinity 3-7 -htp-perf burst`，`/metrics` 各采样 35s）：
+
+| 指标 | 旧（标量） | 新（NEON） |
+|---|---|---|
+| `quant` | 7.39ms | **0.42ms** |
+| `cpu`（decode+quant+post） | 9.36ms | **4.01ms** |
+| `read`（等下一帧的空闲） | 3.77ms | **13.04ms** |
+| `latency` | 15.42ms | **12.05ms** |
+| `execute` | 2.61ms | 3.42ms |
+
+两腿之间 `execute`/`net` 漂了 ~1.3x（上面警告过 CPU 会随大核频率漂移），归一化后
+`quant` 是 **~23x**、`cpu` **-67%**；`read` 从 3.8ms 涨到 13ms，即 60fps 下手机从
+"刚好跑满一个周期"变成 3/4 个周期空闲。代价是 **0 带宽**。
+
+**`read` 才是饱和判据**：`read + decode + quant` 正好等于一个帧周期时，说明这一段已经
+跑满；只看 `cpu` 会漏掉"到底还有没有余量"。
+
+**验证方式**（改的是推理输入，必须证明数值不变，不能只看快了多少）：
+
+1. `yolo/quint16_test.go` 在真机上跑：覆盖全部 256 个取值、NEON 主循环边界长度（15/16/17/31/32/33）、
+   以及 `out` 装不下时不越界写；
+2. `htpbench -image <640x640.jpg>` 比对新旧二进制的输出张量 FNV 哈希 —— 完全相同
+   （`7516f9c6f58cd39b` / `d1ccc00a9ea91f68`），即识别行为零变化。
+
 ### 实测延迟分解（小米13, 30fps 源, 640×640 JPEG ~50KB, 成对交替测）
 
 ```
@@ -352,5 +402,14 @@ streamer 启动时会忙等并重试绑定（约 1-2 秒），推理期间每 5s
 - Android 普通用户读不了 `/proc/stat`（SELinux 拒绝），所以 `[aff]` 的
   busy% 取自推理线程自己的 `/proc/self/task/<tid>/stat` CPU 时间，而不是
   整核统计。
+- **cgo 的 C 代码可能按 `-O0` 编译，而且两条构建路径不一致**：Go 的
+  `CGO_CFLAGS` 默认值是 `-O2 -g`，但 `build_android.ps1` 早先是**直接赋值**
+  `-I$sys/include`，把它丢掉了。于是设备上自编（Termux 的 Go 保留默认 `-O2`）与
+  PC 交叉编译的产物性能差一个数量级：同一个 NEON 内核 `-O0` 下 **6.16ms**、
+  `-O2` 下 **0.126ms**，`-O0` 时甚至比 Go 标量循环还慢 3 倍 —— 表现为
+  "交叉编译出来的 `streamer` 性能反而回退，设备上自编的却正常"。
+  已修：脚本改成**追加**默认值，热路径另外在源码里用 `#cgo CFLAGS: -O2` 钉死。
+  **改 cgo 代码后务必 `llvm-objdump -d` 看一眼反汇编**，`-O0` 的特征很明显：
+  没有 `movi`、常量向量靠逐字节 `ldr b` + `mov v.b[N]` 拼、满屏 `ldr`/`str`。
 
 详细方案、验证记录与风险备选见 [PLAN.md](PLAN.md)。

@@ -8,7 +8,7 @@
 // 两种处理模式:
 //
 //	默认 (串行): read -> decode -> quant -> execute -> post -> write 一条线程走完。
-//	  单帧延迟最低 (没有跨线程交接与缓冲弹跳), 但吞吐上限 = 1/(cpu+exec) ≈ 45fps。
+//	  单帧延迟最低 (没有跨线程交接与缓冲弹跳), 但吞吐上限 = 1/(cpu+exec)。
 //	-pipeline: 拆成 解码+量化 / NPU execute / 后处理+回包 三段 goroutine。
 //	  同帧内 decode -> execute 有数据依赖, 单帧 wall time 不变, 但吞吐上限变成
 //	  1/max(cpu,exec) (实测 30fps 下 cpu+~1.2ms、latency+~1.7ms 的代价换来
@@ -299,7 +299,7 @@ func main() {
 	bench := flag.Bool("bench", false, "per-stage timing stats")
 	affinity := flag.String("affinity", "-1",
 		"固定 worker 线程的 CPU 集合: -1=不绑, 7=单核, 4-7=范围, 4,5,6,7=列表 (小米13 快核=3-7, 小米17 快核=2-7)")
-	pipeline := flag.Bool("pipeline", false, "三段流水线 (吞吐上限 ~59fps, 代价是 30fps 下 cpu+1.2ms/latency+1.7ms)")
+	pipeline := flag.Bool("pipeline", false, "三段流水线 (吞吐上限 = 1/max(CPU前处理, NPU execute), 代价是 30fps 下 cpu+1.2ms/latency+1.7ms)")
 	compress := flag.Bool("compress", false, "enable permessage-deflate (JPEG 不可压, 默认关)")
 	fastjpeg := flag.Bool("fastjpeg", true, "turbojpeg FASTDCT|FASTUPSAMPLE 快解码 (精度略降)")
 	argmaxAll := flag.Bool("argmax-all", false, "后处理对全部 80 类求 argmax (默认只算 -class 指定的那一类, 更快)")

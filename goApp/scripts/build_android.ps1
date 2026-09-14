@@ -76,9 +76,18 @@ $env:CXX = Join-Path $toolchain "aarch64-linux-android$Api-clang++.cmd"
 $env:CGO_ENABLED = '1'
 $env:GOOS = 'android'
 $env:GOARCH = 'arm64'
-$env:CGO_CFLAGS = "-I$sys/include"
+
+# CGO_CFLAGS/CGO_LDFLAGS 必须"追加"而不是覆盖: Go 的默认值是 -O2 -g, 直接赋值会把它丢掉,
+# 于是所有 cgo 的 C 代码都按 clang 默认的 -O0 编译。设备上 (Termux 的 Go 自带 -O2) 与
+# PC 交叉编译的产物因此会有数量级的性能差异 —— yolo 的 NEON 量化内核就踩过: -O0 下比
+# Go 标量循环还慢 3 倍, 交叉编译出来的 streamer 性能反而回退。
+# 先临时清空环境变量再问 go env, 这样在同一 shell 里重复运行脚本也不会把标志叠加成两份。
+Remove-Item Env:CGO_CFLAGS, Env:CGO_LDFLAGS -ErrorAction SilentlyContinue
+$baseC = (go env CGO_CFLAGS).Trim()
+$baseL = (go env CGO_LDFLAGS).Trim()
+$env:CGO_CFLAGS = ("$baseC -I$sys/include").Trim()
 # rpath 指向 Termux 的 $PREFIX/lib, 运行时才能找到 libturbojpeg.so.0
-$env:CGO_LDFLAGS = "-L$sys/lib -lturbojpeg -Wl,-rpath,/data/data/com.termux/files/usr/lib"
+$env:CGO_LDFLAGS = ("$baseL -L$sys/lib -lturbojpeg -Wl,-rpath,/data/data/com.termux/files/usr/lib").Trim()
 
 Write-Host "==> go build $Cmd ($env:GOOS/$env:GOARCH, NDK $((Split-Path $Ndk -Leaf)))"
 go build -o $Out $Cmd
